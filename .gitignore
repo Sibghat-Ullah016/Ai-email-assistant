@@ -1,0 +1,24 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Secrets & Environment Variables (CRITICAL)
+.env
+*.env
+
+# Local Cache & State
+.reply_cooldown_cache.json
+*.cache
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
