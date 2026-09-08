@@ -57,12 +57,17 @@ class GmailIMAPClient:
             raise RuntimeError(f"Failed to select mailbox: {mailbox}")
 
     def search_unseen_emails(self) -> List[str]:
-        """Searches for UNSEEN (unread) email persistent UIDs."""
+        """
+        Searches for emails that are UNSEEN and UNFLAGGED.
+        Prevents reprocessing of starred emails awaiting manual response.
+        Complies strictly with standard IMAP4 search command formatting.
+        """
         if not self.client:
             raise RuntimeError("IMAP client is not connected.")
 
         try:
-            status, data = self.client.uid("search", "UNSEEN")
+            # Pass None for default charset followed by distinct IMAP search criteria
+            status, data = self.client.uid("search", "UNSEEN", "UNFLAGGED")
             if status != "OK" or not data or not data[0]:
                 return []
 
@@ -73,12 +78,16 @@ class GmailIMAPClient:
             return []
 
     def fetch_raw_email(self, email_uid: str) -> Optional[bytes]:
-        """Fetches raw RFC822 bytes for a specific email UID."""
+        """
+        Fetches raw RFC822 bytes using BODY.PEEK[].
+        Strictly preserves the UNSEEN state on the server during inspection.
+        """
         if not self.client:
             raise RuntimeError("IMAP client is not connected.")
 
         try:
-            status, data = self.client.uid("fetch", email_uid, "(RFC822)")
+            # BODY.PEEK[] fetches payload without marking message as \Seen
+            status, data = self.client.uid("fetch", email_uid, "(BODY.PEEK[])")
             if status != "OK" or not data:
                 logger.warning("Could not fetch email UID: %s", email_uid)
                 return None

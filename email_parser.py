@@ -4,8 +4,10 @@ import email
 from email import policy
 from email.header import decode_header
 from email.message import EmailMessage
+from email.utils import parseaddr
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional, cast, Tuple
+
 
 @dataclass
 class ParsedEmail:
@@ -16,9 +18,25 @@ class ParsedEmail:
     date: str
     body: str
     is_truncated: bool = False
+    is_automated: bool = False
+    pre_filter_reason: Optional[str] = None
+
 
 class EmailParser:
     MAX_BODY_CHARS: int = 4000  # Token optimization boundary for Gemini
+
+    AUTOMATED_SENDER_PATTERNS = (
+        "no-reply@",
+        "noreply@",
+        "notifications@",
+        "updates@",
+        "messages-noreply@",
+        "mailer-daemon@",
+        "postmaster@",
+        "newsletter@",
+        "marketing@",
+        "bounce@",
+    )
 
     @staticmethod
     def _clean_header_value(header_val: Optional[object]) -> str:
@@ -28,7 +46,7 @@ class EmailParser:
         """
         if header_val is None:
             return ""
-        
+
         raw_str = str(header_val).strip()
         if "=?" not in raw_str:
             return raw_str
@@ -50,20 +68,11 @@ class EmailParser:
     @staticmethod
     def _clean_html_to_text(html_content: str) -> str:
         """Extracts clean human-readable text from HTML payloads with table and block structure preservation."""
-        # Strip scripts, styles, head, and comments entirely
         clean = re.sub(r"<(script|style|head)[^>]*>.*?</\1>", "", html_content, flags=re.DOTALL | re.IGNORECASE)
         clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
-        
-        # Format table cells with space to prevent column value collision
         clean = re.sub(r"</t[dh]>", "  ", clean, flags=re.IGNORECASE)
-        
-        # Replace block boundaries, headings, lists, and line-breaks with newlines
         clean = re.sub(r"<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>|</blockquote>", "\n", clean, flags=re.IGNORECASE)
-        
-        # Strip remaining HTML tags
         clean = re.sub(r"<[^>]+>", " ", clean)
-        
-        # Decode HTML entities (&nbsp;, &amp;, &lt;, etc.)
         clean = html.unescape(clean)
         return clean
 
@@ -94,7 +103,6 @@ class EmailParser:
         plain_text = ""
         html_text = ""
 
-        # msg.walk() uniformly handles both multipart and single-part EmailMessage objects
         for part in msg.walk():
             if part.get_content_maintype() != "text":
                 continue
@@ -112,7 +120,6 @@ class EmailParser:
                 try:
                     decoded = payload.decode(raw_charset, errors="replace")
                 except (LookupError, UnicodeDecodeError):
-                    # Fallback to UTF-8 then latin-1 for unknown/invalid charsets
                     decoded = payload.decode("utf-8", errors="replace")
 
                 content_subtype = part.get_content_subtype()
@@ -125,12 +132,9 @@ class EmailParser:
 
         raw_body = plain_text if plain_text else html_text
 
-        # Sanitize whitespace and normalize line breaks
         cleaned = re.sub(r"[ \t]+", " ", raw_body)
         cleaned = re.sub(r"\r\n|\r", "\n", cleaned)
         cleaned = re.sub(r"\n\s*\n", "\n\n", cleaned).strip()
-
-        # Strip redundant quote histories
         cleaned = cls._strip_quoted_reply_chains(cleaned)
 
         if not cleaned:
@@ -139,20 +143,54 @@ class EmailParser:
         return cleaned
 
     @classmethod
+    def _detect_automated_or_marketing(cls, msg: EmailMessage, sender_header: str) -> Tuple[bool, Optional[str]]:
+        """
+        Inspects RFC headers and sender patterns to detect bulk,
+        marketing, or automated system mail without calling LLM.
+        """
+        # RFC 2369: Unsubscribe header present indicates mailing list / marketing
+        if msg.get("List-Unsubscribe") or msg.get("List-Id"):
+            return True, "RFC Marketing/Mailing List (List-Unsubscribe/List-Id detected)"
+
+        # Precedence bulk/list/junk
+        precedence = str(msg.get("Precedence", "")).lower().strip()
+        if precedence in ("bulk", "list", "junk"):
+            return True, f"Bulk Precedence Header ({precedence})"
+
+        # RFC 3834 Auto-submitted machine messages
+        auto_submitted = str(msg.get("Auto-Submitted", "")).lower().strip()
+        if auto_submitted and auto_submitted != "no":
+            return True, f"Machine Generated Header (Auto-Submitted: {auto_submitted})"
+
+        # Inspect Sender Email Address
+        _, email_addr = parseaddr(sender_header)
+        email_addr_clean = email_addr.lower().strip()
+
+        for pattern in cls.AUTOMATED_SENDER_PATTERNS:
+            if pattern in email_addr_clean:
+                return True, f"Automated Mailbox Pattern ({pattern})"
+
+        return False, None
+
+    @classmethod
     def parse(cls, email_id: str, raw_bytes: bytes) -> ParsedEmail:
         """Parses raw RFC822 bytes into an optimized, structured ParsedEmail object."""
         msg = cast(EmailMessage, email.message_from_bytes(raw_bytes, policy=policy.default))
 
         sender = cls._clean_header_value(msg.get("From", "Unknown Sender"))
-        subject = cls._clean_header_value(msg.get("Subject", "No Subject"))
+        raw_subject = cls._clean_header_value(msg.get("Subject", ""))
+        subject = raw_subject if raw_subject else "(No Subject)"
         date = cls._clean_header_value(msg.get("Date", "Unknown Date"))
         message_id = cls._clean_header_value(msg.get("Message-ID", ""))
+
+        # Heuristic detection for automated or marketing mail
+        is_automated, reason = cls._detect_automated_or_marketing(msg, sender)
 
         body = cls._extract_body(msg)
         is_truncated = False
 
         if len(body) > cls.MAX_BODY_CHARS:
-            body = body[:cls.MAX_BODY_CHARS] + "\n\n[...Content Truncated for AI Token Optimization...]"
+            body = body[: cls.MAX_BODY_CHARS] + "\n\n[...Content Truncated for AI Token Optimization...]"
             is_truncated = True
 
         return ParsedEmail(
@@ -163,4 +201,6 @@ class EmailParser:
             date=date,
             body=body,
             is_truncated=is_truncated,
+            is_automated=is_automated,
+            pre_filter_reason=reason,
         )

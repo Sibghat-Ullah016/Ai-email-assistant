@@ -49,9 +49,9 @@ class EmailAnalysisResult(BaseModel):
 
 
 class AIEmailEngine:
-    MODEL_NAME: str = "gemini-3.5-flash-lite"
+    MODEL_NAME: str = "gemini-2.5-flash"
     MAX_RETRIES: int = 3
-    INITIAL_BACKOFF_SECONDS: float = 2.0
+    RETRY_DELAYS = (4.0, 12.0, 25.0)  # Realistic backoff window for 429/503 quota recovery
 
     SYSTEM_INSTRUCTION: str = (
         "You are an executive AI Email Assistant specializing in triage, summarization, and safe drafting.\n"
@@ -114,11 +114,10 @@ class AIEmailEngine:
 
     def analyze_email(self, email: ParsedEmail) -> Optional[EmailAnalysisResult]:
         """
-        Sends sanitized email data to Gemini with automatic backoff
-        for transient rate-limiting and server-side errors.
+        Sends sanitized email data to Gemini with resilient backoff for rate limits (429)
+        and transient errors. Yields a safe fallback result if AI fails completely.
         """
         prompt = self._build_prompt(email)
-        backoff = self.INITIAL_BACKOFF_SECONDS
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
@@ -129,13 +128,13 @@ class AIEmailEngine:
                         system_instruction=self.SYSTEM_INSTRUCTION,
                         response_mime_type="application/json",
                         response_schema=EmailAnalysisResult,
-                        temperature=0.1,  # Lower temperature for maximum rule adherence
+                        temperature=0.1,
                     ),
                 )
 
                 if not response.candidates:
                     logger.warning("No response candidates returned for email UID %s.", email.email_id)
-                    return None
+                    return self._build_fallback_result("AI returned empty candidates.")
 
                 candidate = response.candidates[0]
                 finish_reason = getattr(candidate, "finish_reason", None)
@@ -145,24 +144,21 @@ class AIEmailEngine:
                         email.email_id,
                         finish_reason,
                     )
-                    return None
+                    return self._build_fallback_result(f"Triggered model safety filter: {finish_reason}")
 
                 try:
                     raw_json = response.text
                 except (ValueError, AttributeError):
-                    logger.error(
-                        "Failed to extract valid text from response candidates for email UID %s.",
-                        email.email_id,
-                    )
-                    return None
+                    logger.error("Failed to extract valid text from response for email UID %s.", email.email_id)
+                    return self._build_fallback_result("Invalid response text format.")
 
                 if not raw_json:
                     logger.error("Empty text payload received for email UID %s.", email.email_id)
-                    return None
+                    return self._build_fallback_result("Empty JSON payload from model.")
 
                 result = EmailAnalysisResult.model_validate_json(raw_json)
 
-                # Programmatic Defensive Override: If flagged unsafe, force suggested_reply to None
+                # Defensive programmatic guard: Unsafe classifications cannot retain a reply draft
                 if not result.is_auto_reply_safe and result.suggested_reply:
                     logger.info("Enforcing policy override: Clearing draft for unsafe email UID %s.", email.email_id)
                     result.suggested_reply = None
@@ -170,44 +166,49 @@ class AIEmailEngine:
                 return result
 
             except ValidationError as val_err:
-                logger.error(
-                    "Pydantic schema validation error for email UID %s: %s",
-                    email.email_id,
-                    val_err,
-                )
-                return None
+                logger.error("Pydantic schema validation error for email UID %s: %s", email.email_id, val_err)
+                return self._build_fallback_result("Schema validation error from AI output.")
 
             except APIError as api_err:
+                err_msg = str(api_err)
+                err_code = str(getattr(api_err, "code", ""))
+
+                # Non-retriable auth or bad request errors
+                if any(code in err_code for code in ["400", "401", "403", "404"]):
+                    logger.error("Non-retriable client error (%s). Aborting retries for UID %s.", err_code, email.email_id)
+                    return self._build_fallback_result(f"Non-retriable API error ({err_code}).")
+
+                # Retriable errors: 429, RESOURCE_EXHAUSTED, 503, UNAVAILABLE
                 logger.warning(
-                    "Gemini API Error (attempt %d/%d): %s",
+                    "Gemini API rate limit or transient error (Attempt %d/%d): %s",
                     attempt,
                     self.MAX_RETRIES,
-                    api_err,
+                    err_msg,
                 )
-
-                # Check non-retriable client errors (400, 401, 403, 404)
-                err_code = str(getattr(api_err, "code", ""))
-                if any(code in err_code for code in ["400", "401", "403", "404"]):
-                    logger.error(
-                        "Non-retriable client error (%s). Aborting retries for UID %s.",
-                        err_code,
-                        email.email_id,
-                    )
-                    return None
 
                 if attempt == self.MAX_RETRIES:
-                    logger.error("Max retries reached. Failing email UID %s.", email.email_id)
-                    return None
+                    logger.error("Max retries exhausted for email UID %s. Applying safe manual fallback.", email.email_id)
+                    return self._build_fallback_result("API rate limits exhausted after maximum retries.")
 
-                time.sleep(backoff)
-                backoff *= 2
+                delay = self.RETRY_DELAYS[attempt - 1]
+                logger.info("Sleeping %.1f seconds before retry...", delay)
+                time.sleep(delay)
 
             except Exception as err:
-                logger.error(
-                    "Unexpected error analyzing email UID %s: %s",
-                    email.email_id,
-                    err,
-                )
-                return None
+                logger.error("Unexpected exception analyzing email UID %s: %s", email.email_id, err)
+                return self._build_fallback_result(f"Unexpected runtime failure: {err}")
 
-        return None
+        return self._build_fallback_result("Exhausted all analysis attempts.")
+
+    def _build_fallback_result(self, reason: str) -> EmailAnalysisResult:
+        """
+        Defensive fallback: Never drop an email silently.
+        Flags it for manual review and leaves it safely unreplied.
+        """
+        return EmailAnalysisResult(
+            category=EmailCategory.ACTION_REQUIRED,
+            priority=PriorityLevel.HIGH,
+            summary=f"Automated analysis unavailable ({reason}). Flagged for manual review.",
+            is_auto_reply_safe=False,
+            suggested_reply=None,
+        )
